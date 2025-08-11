@@ -80,8 +80,8 @@ A cross-platform, local-first personal finance application built with Python tha
 1. Clone the repository
 2. Create a virtual environment:
    ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
+   python3 -m venv f_venv
+   source f_venv/bin/activate  # On Windows: f_venv\Scripts\activate
    ```
 3. Install dependencies:
    ```bash
@@ -90,7 +90,7 @@ A cross-platform, local-first personal finance application built with Python tha
 
 ### Running the Application
 ```bash
-python src/main.py
+python3 src/main.py
 ```
 
 ## Development

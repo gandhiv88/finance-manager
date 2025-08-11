@@ -18,6 +18,11 @@ from typing import Optional, List, Dict, Any, Union
 from contextlib import contextmanager
 import hashlib
 import os
+import json
+import base64
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
 class DatabaseManager:

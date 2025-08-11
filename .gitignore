@@ -135,10 +135,7 @@ cython_debug/
 .idea/
 
 # VS Code
-.vscode/settings.json
-.vscode/launch.json
-.vscode/extensions.json
-.vscode/*.code-snippets
+.vscode/
 
 # Local History for Visual Studio Code
 .history/
@@ -249,12 +246,11 @@ htmlcov/
 
 # Virtual environments
 venv*/
+f_venv/
 env*/
 .env*
 
 # IDE files
-.vscode/settings.json
-.vscode/launch.json
 .idea/
 *.swp
 *.swo
