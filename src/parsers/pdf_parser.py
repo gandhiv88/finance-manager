@@ -84,12 +84,15 @@ class PDFParser:
         }
         self.debug = os.environ.get("FINANCE_DEBUG", "").lower() == "true"
 
-    def parse_file(self, file_path: Path) -> List[Dict[str, Any]]:
+    def parse_file(
+        self, file_path: Path, account_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """
         Parse a PDF financial statement.
 
         Args:
             file_path: Path to PDF file
+            account_type: Type of account ('checking', 'savings', 'credit')
 
         Returns:
             List[Dict[str, Any]]: Extracted transaction data
@@ -104,8 +107,12 @@ class PDFParser:
             transactions = []
             file_hash = self.secure_handler.calculate_file_hash(validated_path)
 
+            # Detect statement type from content if not provided
+            if not account_type:
+                account_type = self._detect_statement_type(validated_path)
+
             # Try text extraction first
-            text_transactions = self._extract_text_data(validated_path)
+            text_transactions = self._extract_text_data(validated_path, account_type)
             if text_transactions:
                 # Attach file hash
                 for t in text_transactions:
@@ -122,7 +129,7 @@ class PDFParser:
 
             # If no text data or insufficient data, try OCR
             if len(transactions) == 0:
-                ocr_transactions = self._extract_ocr_data(validated_path)
+                ocr_transactions = self._extract_ocr_data(validated_path, account_type)
                 if ocr_transactions:
                     for t in ocr_transactions:
                         t["file_hash"] = file_hash
@@ -139,7 +146,91 @@ class PDFParser:
             self.logger.error(f"PDF parsing failed: {e}")
             return []
 
-    def _extract_text_data(self, file_path: Path) -> List[Dict[str, Any]]:
+    def _detect_statement_type(self, file_path: Path) -> str:
+        """
+        Detect whether this is a bank or credit card statement.
+
+        Args:
+            file_path: Path to PDF file
+
+        Returns:
+            str: 'credit', 'checking', or 'savings'
+        """
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                # Get first two pages of text for analysis
+                sample_text = ""
+                for page in pdf.pages[:2]:
+                    page_text = page.extract_text()
+                    if page_text:
+                        sample_text += page_text.lower()
+
+                # Credit card indicators
+                credit_indicators = [
+                    "credit card",
+                    "creditcard",
+                    "card statement",
+                    "mastercard",
+                    "visa",
+                    "american express",
+                    "amex",
+                    "discover",
+                    "minimum payment",
+                    "credit limit",
+                    "available credit",
+                    "payment due",
+                    "apr",
+                    "annual percentage rate",
+                    "finance charge",
+                    "cash advance",
+                ]
+
+                # Bank account indicators
+                checking_indicators = [
+                    "checking",
+                    "check",
+                    "debit card",
+                    "atm",
+                    "overdraft",
+                    "direct deposit",
+                    "wire transfer",
+                    "ach",
+                    "electronic transfer",
+                ]
+
+                savings_indicators = [
+                    "savings",
+                    "interest earned",
+                    "dividend",
+                    "money market",
+                ]
+
+                # Count matches
+                credit_score = sum(
+                    1 for indicator in credit_indicators if indicator in sample_text
+                )
+                checking_score = sum(
+                    1 for indicator in checking_indicators if indicator in sample_text
+                )
+                savings_score = sum(
+                    1 for indicator in savings_indicators if indicator in sample_text
+                )
+
+                # Return type with highest score
+                if credit_score > max(checking_score, savings_score):
+                    return "credit"
+                elif savings_score > checking_score:
+                    return "savings"
+                else:
+                    return "checking"
+
+        except Exception as e:
+            self.logger.debug(f"Statement type detection failed: {e}")
+            return "checking"  # Default fallback
+
+    def _extract_text_data(
+        self, file_path: Path, account_type: str = "checking"
+    ) -> List[Dict[str, Any]]:
         """
         Extract text data from PDF using pdfplumber.
 
@@ -164,7 +255,7 @@ class PDFParser:
                         all_text += page_text + "\n"
 
                 # Parse transactions from text
-                transactions = self._parse_transaction_text(all_text)
+                transactions = self._parse_transaction_text(all_text, account_type)
 
                 # Try table extraction as well
                 table_transactions = self._extract_table_data(pdf)
@@ -233,7 +324,9 @@ class PDFParser:
 
         return transactions
 
-    def _extract_ocr_data(self, file_path: Path) -> List[Dict[str, Any]]:
+    def _extract_ocr_data(
+        self, file_path: Path, account_type: str = "checking"
+    ) -> List[Dict[str, Any]]:
         """
         Extract data using OCR for scanned PDFs.
 
@@ -269,7 +362,9 @@ class PDFParser:
                         )
 
                         # Parse OCR text for transactions
-                        page_transactions = self._parse_transaction_text(ocr_text)
+                        page_transactions = self._parse_transaction_text(
+                            ocr_text, account_type
+                        )
                         transactions.extend(page_transactions)
 
         except Exception as e:
@@ -277,12 +372,15 @@ class PDFParser:
 
         return transactions
 
-    def _parse_transaction_text(self, text: str) -> List[Dict[str, Any]]:
+    def _parse_transaction_text(
+        self, text: str, account_type: str = "checking"
+    ) -> List[Dict[str, Any]]:
         """
         Parse transaction data from extracted text.
 
         Args:
             text: Extracted text content
+            account_type: Type of account ('checking', 'savings', 'credit')
 
         Returns:
             List[Dict[str, Any]]: Parsed transactions
@@ -296,7 +394,7 @@ class PDFParser:
                 continue
 
             # Look for transaction patterns
-            transaction = self._extract_transaction_from_line(line)
+            transaction = self._extract_transaction_from_line(line, account_type)
             if transaction:
                 transactions.append(transaction)
 
@@ -305,12 +403,15 @@ class PDFParser:
 
         return transactions
 
-    def _extract_transaction_from_line(self, line: str) -> Optional[Dict[str, Any]]:
+    def _extract_transaction_from_line(
+        self, line: str, account_type: str = "checking"
+    ) -> Optional[Dict[str, Any]]:
         """
         Extract transaction data from a single line of text.
 
         Args:
             line: Single line of text
+            account_type: Type of account ('checking', 'savings', 'credit')
 
         Returns:
             Optional[Dict[str, Any]]: Transaction data or None
@@ -398,10 +499,9 @@ class PDFParser:
             if negative_by_parentheses:
                 amount = -amount
 
-            transaction_type = (
-                "debit"
-                if negative_by_parentheses or "-" in line or "debit" in line.lower()
-                else "credit"
+            # Determine transaction type based on account type and patterns
+            transaction_type = self._determine_transaction_type(
+                line, amount, negative_by_parentheses, account_type
             )
 
             description = self._extract_description(line, matched_date_text, amount_str)
@@ -420,6 +520,84 @@ class PDFParser:
         except Exception as e:
             self.logger.debug(f"Failed to parse line '{line}': {e}")
             return None
+
+    def _determine_transaction_type(
+        self, line: str, amount: float, negative_by_parentheses: bool, account_type: str
+    ) -> str:
+        """
+        Determine transaction type based on account type and transaction details.
+
+        Args:
+            line: Transaction line text
+            amount: Transaction amount
+            negative_by_parentheses: Whether amount was in parentheses
+            account_type: Type of account ('checking', 'savings', 'credit')
+
+        Returns:
+            str: 'debit' or 'credit'
+        """
+        line_lower = line.lower()
+
+        if account_type == "credit":
+            # Credit card logic: purchases are debits, payments are credits
+            payment_indicators = [
+                "payment",
+                "autopay",
+                "online payment",
+                "check payment",
+                "electronic payment",
+                "payment received",
+                "thank you",
+                "payment - thank you",
+                "autopay payment",
+                "online pmt",
+                "pmt",
+            ]
+
+            # Check for payment indicators
+            if any(indicator in line_lower for indicator in payment_indicators):
+                return "credit"  # Payment reduces credit card balance
+            else:
+                return "debit"  # Purchase increases credit card balance
+
+        else:
+            # Bank account logic: deposits are credits, withdrawals/purchases are debits
+            credit_indicators = [
+                "deposit",
+                "direct dep",
+                "payroll",
+                "salary",
+                "transfer in",
+                "interest",
+                "refund",
+                "credit",
+                "incoming",
+            ]
+
+            debit_indicators = [
+                "withdrawal",
+                "purchase",
+                "debit",
+                "atm",
+                "fee",
+                "check",
+                "transfer out",
+                "payment",
+                "auto pay",
+            ]
+
+            # First check explicit indicators
+            if any(indicator in line_lower for indicator in credit_indicators):
+                return "credit"
+            elif any(indicator in line_lower for indicator in debit_indicators):
+                return "debit"
+            # Then check formatting (parentheses usually indicate debits for bank accounts)
+            elif negative_by_parentheses:
+                return "debit"
+            else:
+                # For bank accounts, if no clear indicator, assume it's a debit (expense/withdrawal)
+                # This is common for bank statements where debits are more frequent
+                return "debit"
 
     def _extract_description(
         self, line: str, original_date_token: Optional[str], amount_str: str
