@@ -12,6 +12,7 @@ Security Rationale:
 """
 
 import sys
+import os
 import logging
 from pathlib import Path
 from typing import Optional, List
@@ -203,6 +204,11 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Personal Finance Manager")
         self.setGeometry(100, 100, 1200, 800)
 
+        # Set application icon
+        icon_path = Path(__file__).parent.parent.parent / "resources" / "app_icon.png"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
+
         # Central widget with tabs
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -357,7 +363,27 @@ class MainWindow(QMainWindow):
         Authenticate user with password.
 
         Security: Required for database access.
+        Development: Set FINANCE_DEV_MODE=true to use default password.
         """
+        # Development mode bypass
+        dev_mode = os.environ.get('FINANCE_DEV_MODE', '').lower() == 'true'
+        if dev_mode:
+            password = "dev_password_123"
+            self.logger.warning("Running in development mode with default password")
+            
+            if not self.db_manager.db_path.exists():
+                if self.db_manager.initialize_database(password):
+                    self.current_password = password
+                    self.status_bar.showMessage("Dev database created")
+                    return
+            else:
+                if self.db_manager.verify_password(password):
+                    self.current_password = password
+                    self._load_transactions()
+                    self.status_bar.showMessage("Dev database unlocked")
+                    return
+        
+        # Normal authentication flow
         while True:
             password_dialog = PasswordDialog(self, "Database Password")
 
