@@ -236,12 +236,18 @@ class FileImportThread(QThread):
     def _record_file_import(self, file_path: str, transaction_count: int) -> None:
         """Record file import for audit trail."""
         try:
+            import hashlib
+
+            # Calculate file hash for tracking
+            file_hash = hashlib.md5(str(file_path).encode()).hexdigest()
+            file_size = Path(file_path).stat().st_size
+
             with self.db_manager._get_connection(self.password) as conn:
                 conn.execute(
                     """INSERT INTO file_imports 
-                       (filename, import_date, transaction_count) 
-                       VALUES (?, datetime('now'), ?)""",
-                    (Path(file_path).name, transaction_count),
+                       (filename, file_hash, file_size, transactions_imported) 
+                       VALUES (?, ?, ?, ?)""",
+                    (Path(file_path).name, file_hash, file_size, transaction_count),
                 )
         except Exception as e:
             print(f"Warning: Could not record file import: {e}")
@@ -2040,3 +2046,196 @@ class MainWindow(QMainWindow):
             self.recent_large_table.setItem(row, 3, QTableWidgetItem(category))
 
         self.recent_large_table.resizeColumnsToContents()
+
+    def _create_summary_card(self, title: str, value: str, color: str) -> QWidget:
+        """Create a summary card widget for analytics."""
+        card = QWidget()
+        card.setFixedSize(180, 100)
+        card.setStyleSheet(f"""
+            QWidget {{
+                background-color: white;
+                border: 2px solid {color};
+                border-radius: 8px;
+                margin: 5px;
+            }}
+        """)
+
+        layout = QVBoxLayout()
+        card.setLayout(layout)
+
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-size: 12px; font-weight: bold; color: #666;")
+        title_label.setAlignment(Qt.AlignCenter)
+
+        value_label = QLabel(value)
+        value_label.setObjectName("value")
+        value_label.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {color};")
+        value_label.setAlignment(Qt.AlignCenter)
+
+        layout.addWidget(title_label)
+        layout.addWidget(value_label)
+
+        return card
+
+    def _load_categories(self):
+        """Load and display categories in the table."""
+        if not self.current_password:
+            return
+
+        try:
+            categories = self.db_manager.get_categories(self.current_password)
+
+            # Update categories table
+            self.categories_table.setRowCount(len(categories))
+
+            for row, category in enumerate(categories):
+                # Category name
+                self.categories_table.setItem(
+                    row, 0, QTableWidgetItem(str(category.get("name", "")))
+                )
+
+                # Category type
+                category_type = "Income" if category.get("is_income") else "Expense"
+                self.categories_table.setItem(row, 1, QTableWidgetItem(category_type))
+
+                # Parent category
+                parent_name = category.get("parent_name", "")
+                self.categories_table.setItem(row, 2, QTableWidgetItem(parent_name))
+
+                # Transaction count (placeholder for now)
+                self.categories_table.setItem(row, 3, QTableWidgetItem("0"))
+
+                # Actions (Delete button)
+                if not category.get("parent_name"):  # Only show delete for non-default categories
+                    delete_btn = QPushButton("Delete")
+                    delete_btn.setStyleSheet("background-color: #ffcccc; color: red;")
+                    category_id = category.get("id")
+                    delete_btn.clicked.connect(
+                        lambda checked, cid=category_id, name=category.get("name"): self._delete_category(cid, name)
+                    )
+                    self.categories_table.setCellWidget(row, 4, delete_btn)
+
+            # Update statistics
+            total = len(categories)
+            income_count = sum(1 for cat in categories if cat.get("is_income"))
+            expense_count = total - income_count
+
+            self.total_categories_label.setText(f"Total Categories: {total}")
+            self.income_categories_label.setText(f"Income: {income_count}")
+            self.expense_categories_label.setText(f"Expense: {expense_count}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to load categories: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to load categories: {str(e)}")
+
+    def _add_category(self):
+        """Add a new category."""
+        if not self.current_password:
+            QMessageBox.warning(self, "Error", "Database not authenticated")
+            return
+
+        # Create category dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add New Category")
+        dialog.setFixedSize(400, 200)
+
+        layout = QVBoxLayout()
+
+        # Category name
+        name_layout = QHBoxLayout()
+        name_layout.addWidget(QLabel("Category Name:"))
+        name_input = QLineEdit()
+        name_layout.addWidget(name_input)
+        layout.addLayout(name_layout)
+
+        # Category type
+        type_layout = QHBoxLayout()
+        type_layout.addWidget(QLabel("Type:"))
+        type_combo = QComboBox()
+        type_combo.addItems(["Expense", "Income"])
+        type_layout.addWidget(type_combo)
+        layout.addLayout(type_layout)
+
+        # Description
+        desc_layout = QHBoxLayout()
+        desc_layout.addWidget(QLabel("Description:"))
+        desc_input = QLineEdit()
+        desc_layout.addWidget(desc_input)
+        layout.addLayout(desc_layout)
+
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        dialog.setLayout(layout)
+
+        if dialog.exec_() == QDialog.Accepted:
+            name = name_input.text().strip()
+            is_income = type_combo.currentText() == "Income"
+            description = desc_input.text().strip()
+
+            if name:
+                try:
+                    category_id = self.db_manager.add_category(
+                        self.current_password, name, description, is_income
+                    )
+                    if category_id:
+                        QMessageBox.information(
+                            self, "Success", f"Category '{name}' added successfully!"
+                        )
+                        self._load_categories()  # Refresh the table
+                    else:
+                        QMessageBox.warning(self, "Error", "Failed to add category")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Failed to add category: {str(e)}")
+            else:
+                QMessageBox.warning(self, "Error", "Category name is required")
+
+    def _delete_category(self, category_id: int, category_name: str):
+        """Delete a category with confirmation."""
+        reply = QMessageBox.question(
+            self,
+            "Delete Category",
+            f"Are you sure you want to delete the category '{category_name}'?\n"
+            "This action cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if reply == QMessageBox.Yes:
+            try:
+                success = self.db_manager.delete_category(self.current_password, category_id)
+                if success:
+                    QMessageBox.information(
+                        self, "Success", f"Category '{category_name}' deleted successfully!"
+                    )
+                    self._load_categories()  # Refresh the table
+                else:
+                    QMessageBox.warning(self, "Error", "Failed to delete category")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to delete category: {str(e)}")
+
+    def _load_analytics_accounts(self):
+        """Load accounts for analytics filtering."""
+        if not self.current_password:
+            return
+
+        try:
+            # Clear existing items (except "All Accounts")
+            self.account_filter_combo.clear()
+            self.account_filter_combo.addItem("All Accounts")
+
+            with self.db_manager._get_connection(self.current_password) as conn:
+                cursor = conn.execute(
+                    "SELECT id, account_name FROM accounts ORDER BY account_name"
+                )
+                for account_id, account_name in cursor.fetchall():
+                    self.account_filter_combo.addItem(account_name, account_id)
+
+            # Load initial analytics
+            self._update_analytics()
+
+        except Exception as e:
+            self.logger.error(f"Failed to load analytics accounts: {e}")
