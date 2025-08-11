@@ -246,6 +246,48 @@ class FileImportThread(QThread):
         except Exception as e:
             print(f"Warning: Could not record file import: {e}")
 
+    def _map_categories_to_ids(self, transactions):
+        """Map predicted category names to database category IDs."""
+        if not self.password:
+            return
+
+        try:
+            # Get all categories from database
+            with self.db_manager._get_connection(self.password) as conn:
+                cursor = conn.execute("SELECT id, name FROM categories")
+                category_map = {
+                    name.lower(): cat_id for cat_id, name in cursor.fetchall()
+                }
+
+            # Map predicted categories to IDs
+            for transaction in transactions:
+                predicted_category = transaction.get("predicted_category", "").lower()
+
+                if predicted_category in category_map:
+                    transaction["category_id"] = category_map[predicted_category]
+                elif predicted_category == "food":
+                    # Map common ML categories to database categories
+                    transaction["category_id"] = category_map.get("food & dining")
+                elif predicted_category == "transportation":
+                    transaction["category_id"] = category_map.get("transportation")
+                elif predicted_category == "shopping":
+                    transaction["category_id"] = category_map.get("shopping")
+                elif predicted_category == "entertainment":
+                    transaction["category_id"] = category_map.get("entertainment")
+                elif predicted_category == "utilities":
+                    transaction["category_id"] = category_map.get("bills & utilities")
+                elif predicted_category == "healthcare":
+                    transaction["category_id"] = category_map.get("healthcare")
+                elif predicted_category == "income":
+                    transaction["category_id"] = category_map.get("income")
+                else:
+                    # Leave as None for uncategorized
+                    transaction["category_id"] = None
+
+        except Exception as e:
+            self.logger.error(f"Failed to map categories: {e}")
+            # If mapping fails, leave categories as None
+
 
 class MainWindow(QMainWindow):
     """
@@ -1193,48 +1235,6 @@ class MainWindow(QMainWindow):
             self.current_password = None
 
         event.accept()
-
-    def _map_categories_to_ids(self, transactions):
-        """Map predicted category names to database category IDs."""
-        if not self.current_password:
-            return
-
-        try:
-            # Get all categories from database
-            with self.db_manager._get_connection(self.current_password) as conn:
-                cursor = conn.execute("SELECT id, name FROM categories")
-                category_map = {
-                    name.lower(): cat_id for cat_id, name in cursor.fetchall()
-                }
-
-            # Map predicted categories to IDs
-            for transaction in transactions:
-                predicted_category = transaction.get("predicted_category", "").lower()
-
-                if predicted_category in category_map:
-                    transaction["category_id"] = category_map[predicted_category]
-                elif predicted_category == "food":
-                    # Map common ML categories to database categories
-                    transaction["category_id"] = category_map.get("food & dining")
-                elif predicted_category == "transportation":
-                    transaction["category_id"] = category_map.get("transportation")
-                elif predicted_category == "shopping":
-                    transaction["category_id"] = category_map.get("shopping")
-                elif predicted_category == "entertainment":
-                    transaction["category_id"] = category_map.get("entertainment")
-                elif predicted_category == "utilities":
-                    transaction["category_id"] = category_map.get("bills & utilities")
-                elif predicted_category == "healthcare":
-                    transaction["category_id"] = category_map.get("healthcare")
-                elif predicted_category == "income":
-                    transaction["category_id"] = category_map.get("income")
-                else:
-                    # Leave as None for uncategorized
-                    transaction["category_id"] = None
-
-        except Exception as e:
-            self.logger.error(f"Failed to map categories: {e}")
-            # If mapping fails, leave categories as None
 
     def _load_file_imports(self):
         """Load and display file imports in the table."""
