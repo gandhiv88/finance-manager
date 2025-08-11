@@ -26,6 +26,15 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
 class DatabaseManager:
+    def is_password_set(self) -> bool:
+        """
+        Check if a password hash is set in the database.
+        Returns:
+            bool: True if password hash exists, False otherwise
+        """
+        self._load_password_hash()
+        return bool(self._password_hash)
+
     """
     Manages encrypted database operations using SQLCipher.
 
@@ -46,6 +55,24 @@ class DatabaseManager:
 
         self._password_hash: Optional[str] = None
         self._connection: Optional[sqlite3.Connection] = None
+        self._load_password_hash()
+
+    def _load_password_hash(self):
+        """
+        Load password hash from settings table if it exists.
+        """
+        if self.db_path.exists():
+            try:
+                conn = sqlite3.connect(str(self.db_path))
+                cursor = conn.execute(
+                    "SELECT value FROM settings WHERE key = 'password_hash'"
+                )
+                row = cursor.fetchone()
+                if row:
+                    self._password_hash = row[0]
+                conn.close()
+            except Exception as e:
+                self.logger.warning(f"Could not load password hash: {e}")
 
     def initialize_database(self, password: str) -> bool:
         """
@@ -66,6 +93,12 @@ class DatabaseManager:
 
             with self._get_connection(password) as conn:
                 self._create_schema(conn)
+                # Store password hash in settings table
+                conn.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                    ("password_hash", self._password_hash),
+                )
+                conn.commit()
                 self.logger.info("Database initialized successfully")
                 return True
 
@@ -85,11 +118,15 @@ class DatabaseManager:
 
         Security: Uses hash comparison to verify password.
         """
+        # Always reload hash from settings table to ensure correct value
+        self._load_password_hash()
         if not self._password_hash:
             return False
-
         password_hash = hashlib.sha256(password.encode()).hexdigest()
-        return password_hash == self._password_hash
+        if password_hash == self._password_hash:
+            self._password_hash = password_hash  # Set in memory for session
+            return True
+        return False
 
     @contextmanager
     def _get_connection(self, password: str):

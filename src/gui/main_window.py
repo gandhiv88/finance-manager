@@ -2051,14 +2051,16 @@ class MainWindow(QMainWindow):
         """Create a summary card widget for analytics."""
         card = QWidget()
         card.setFixedSize(180, 100)
-        card.setStyleSheet(f"""
+        card.setStyleSheet(
+            f"""
             QWidget {{
                 background-color: white;
                 border: 2px solid {color};
                 border-radius: 8px;
                 margin: 5px;
             }}
-        """)
+        """
+        )
 
         layout = QVBoxLayout()
         card.setLayout(layout)
@@ -2069,7 +2071,9 @@ class MainWindow(QMainWindow):
 
         value_label = QLabel(value)
         value_label.setObjectName("value")
-        value_label.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {color};")
+        value_label.setStyleSheet(
+            f"font-size: 18px; font-weight: bold; color: {color};"
+        )
         value_label.setAlignment(Qt.AlignCenter)
 
         layout.addWidget(title_label)
@@ -2106,12 +2110,16 @@ class MainWindow(QMainWindow):
                 self.categories_table.setItem(row, 3, QTableWidgetItem("0"))
 
                 # Actions (Delete button)
-                if not category.get("parent_name"):  # Only show delete for non-default categories
+                if not category.get(
+                    "parent_name"
+                ):  # Only show delete for non-default categories
                     delete_btn = QPushButton("Delete")
                     delete_btn.setStyleSheet("background-color: #ffcccc; color: red;")
                     category_id = category.get("id")
                     delete_btn.clicked.connect(
-                        lambda checked, cid=category_id, name=category.get("name"): self._delete_category(cid, name)
+                        lambda checked, cid=category_id, name=category.get(
+                            "name"
+                        ): self._delete_category(cid, name)
                     )
                     self.categories_table.setCellWidget(row, 4, delete_btn)
 
@@ -2189,7 +2197,9 @@ class MainWindow(QMainWindow):
                     else:
                         QMessageBox.warning(self, "Error", "Failed to add category")
                 except Exception as e:
-                    QMessageBox.critical(self, "Error", f"Failed to add category: {str(e)}")
+                    QMessageBox.critical(
+                        self, "Error", f"Failed to add category: {str(e)}"
+                    )
             else:
                 QMessageBox.warning(self, "Error", "Category name is required")
 
@@ -2206,16 +2216,22 @@ class MainWindow(QMainWindow):
 
         if reply == QMessageBox.Yes:
             try:
-                success = self.db_manager.delete_category(self.current_password, category_id)
+                success = self.db_manager.delete_category(
+                    self.current_password, category_id
+                )
                 if success:
                     QMessageBox.information(
-                        self, "Success", f"Category '{category_name}' deleted successfully!"
+                        self,
+                        "Success",
+                        f"Category '{category_name}' deleted successfully!",
                     )
                     self._load_categories()  # Refresh the table
                 else:
                     QMessageBox.warning(self, "Error", "Failed to delete category")
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to delete category: {str(e)}")
+                QMessageBox.critical(
+                    self, "Error", f"Failed to delete category: {str(e)}"
+                )
 
     def _load_analytics_accounts(self):
         """Load accounts for analytics filtering."""
