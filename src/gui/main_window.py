@@ -37,6 +37,8 @@ from PyQt5.QtWidgets import (
     QDialog,
     QLineEdit,
     QDialogButtonBox,
+    QComboBox,
+    QFormLayout,
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, pyqtSlot
 from PyQt5.QtGui import QIcon, QFont
@@ -134,11 +136,18 @@ class FileImportThread(QThread):
     progress_updated = pyqtSignal(int)
     import_completed = pyqtSignal(bool, str)
 
-    def __init__(self, file_path: Path, db_manager: DatabaseManager, password: str):
+    def __init__(
+        self,
+        file_path: Path,
+        db_manager: DatabaseManager,
+        password: str,
+        account_id: int,
+    ):
         super().__init__()
         self.file_path = file_path
         self.db_manager = db_manager
         self.password = password
+        self.account_id = account_id
         self.logger = logging.getLogger(__name__)
 
     def run(self):
@@ -189,6 +198,7 @@ class FileImportThread(QThread):
             # Save to database
             success_count = 0
             for transaction in categorized_transactions:
+                transaction["account_id"] = self.account_id
                 transaction_id = self.db_manager.add_transaction(
                     self.password, transaction
                 )
@@ -390,104 +400,157 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(analytics_widget, "Analytics")
 
     def _authenticate_user(self):
-        """
-        Authenticate user with password.
-
-        Security: Required for database access.
-        Development: Set FINANCE_DEV_MODE=true to use default password.
-        """
-        # Development mode bypass
-        dev_mode = os.environ.get("FINANCE_DEV_MODE", "").lower() == "true"
-        if dev_mode:
-            password = "dev_password_123"
-            self.logger.warning("Running in development mode with default password")
-
-            if not self.db_manager.db_path.exists():
-                if self.db_manager.initialize_database(password):
-                    self.current_password = password
-                    self.status_bar.showMessage("Dev database created")
-                    return
-            else:
-                if self.db_manager.verify_password(password):
-                    self.current_password = password
-                    self._load_transactions()
-                    self.status_bar.showMessage("Dev database unlocked")
-                    return
+        """Authenticate user or setup password on first run."""
+        # Check if database exists
+        db_exists = self.db_manager.db_path.exists()
+        if not db_exists:
+            # Prompt to set password
+            password_dialog = QDialog(self)
+            password_dialog.setWindowTitle("Set Database Password")
+            layout = QVBoxLayout()
+            label = QLabel("Create a password to secure your financial data:")
+            password_input = QLineEdit()
+            password_input.setEchoMode(QLineEdit.Password)
+            layout.addWidget(label)
+            layout.addWidget(password_input)
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            layout.addWidget(buttons)
+            password_dialog.setLayout(layout)
+            buttons.accepted.connect(password_dialog.accept)
+            buttons.rejected.connect(password_dialog.reject)
+            if password_dialog.exec_() == QDialog.Accepted:
+                new_password = password_input.text() or "new_password_123"
+                if self.db_manager.initialize_database(new_password):
+                    self.current_password = new_password
+                    self.status_bar.showMessage("New database created successfully")
                 else:
-                    # Dev mode but wrong password - offer to reset
-                    reply = QMessageBox.question(
-                        self,
-                        "Development Mode - Reset Database?",
-                        "Development mode detected but database has different password.\n"
-                        "Reset database with dev password?\n"
-                        "(This will DELETE existing data)",
-                        QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.No,
-                    )
-                    if reply == QMessageBox.Yes:
-                        self.db_manager.db_path.unlink()  # Delete existing database
+                    QMessageBox.critical(self, "Error", "Failed to create database")
+                    sys.exit(1)
+            else:
+                sys.exit(0)
+        else:
+            # Normal authentication flow
+            while True:
+                password_dialog = PasswordDialog(self, "Database Password")
+
+                if password_dialog.exec_() == QDialog.Accepted:
+                    # Check if reset was requested
+                    if password_dialog.reset_requested:
+                        # Delete existing database and create new one
+                        if self.db_manager.db_path.exists():
+                            self.db_manager.db_path.unlink()
+
+                        new_password = (
+                            password_dialog.get_password() or "new_password_123"
+                        )
+                        if self.db_manager.initialize_database(new_password):
+                            self.current_password = new_password
+                            self.status_bar.showMessage(
+                                "New database created successfully"
+                            )
+                            break
+                        else:
+                            QMessageBox.critical(
+                                self, "Error", "Failed to create new database"
+                            )
+                        continue
+
+                    password = password_dialog.get_password()
+
+                    # Check if database exists
+                    if not self.db_manager.db_path.exists():
+                        # Initialize new database
                         if self.db_manager.initialize_database(password):
                             self.current_password = password
-                            self.status_bar.showMessage("Dev database reset")
-                            return
-
-        # Normal authentication flow
-        while True:
-            password_dialog = PasswordDialog(self, "Database Password")
-
-            if password_dialog.exec_() == QDialog.Accepted:
-                # Check if reset was requested
-                if password_dialog.reset_requested:
-                    # Delete existing database and create new one
-                    if self.db_manager.db_path.exists():
-                        self.db_manager.db_path.unlink()
-
-                    new_password = password_dialog.get_password() or "new_password_123"
-                    if self.db_manager.initialize_database(new_password):
-                        self.current_password = new_password
-                        self.status_bar.showMessage("New database created successfully")
-                        break
+                            self.status_bar.showMessage(
+                                "New encrypted database created"
+                            )
+                            break
+                        else:
+                            QMessageBox.critical(
+                                self, "Error", "Failed to create database"
+                            )
                     else:
-                        QMessageBox.critical(
-                            self, "Error", "Failed to create new database"
-                        )
-                    continue
+                        # Verify existing database
+                        if self.db_manager.verify_password(password):
+                            self.current_password = password
+                            self._load_transactions()
+                            self.status_bar.showMessage(
+                                "Database unlocked successfully"
+                            )
+                            break
+                        else:
+                            QMessageBox.warning(
+                                self,
+                                "Invalid Password",
+                                "Incorrect password. Please try again.",
+                            )
 
-                password = password_dialog.get_password()
-
-                # Check if database exists
-                if not self.db_manager.db_path.exists():
-                    # Initialize new database
-                    if self.db_manager.initialize_database(password):
-                        self.current_password = password
-                        self.status_bar.showMessage("New encrypted database created")
-                        break
-                    else:
-                        QMessageBox.critical(self, "Error", "Failed to create database")
+                    password_dialog.clear_password()
                 else:
-                    # Verify existing database
-                    if self.db_manager.verify_password(password):
-                        self.current_password = password
-                        self._load_transactions()
-                        self.status_bar.showMessage("Database unlocked successfully")
-                        break
-                    else:
-                        QMessageBox.warning(
-                            self,
-                            "Invalid Password",
-                            "Incorrect password. Please try again.",
-                        )
-
-                password_dialog.clear_password()
-            else:
-                # User cancelled - exit application
-                sys.exit(0)
+                    # User cancelled - exit application
+                    sys.exit(0)
 
     def _import_file(self):
-        """Import a financial statement file."""
+        """Import a financial statement file with account selection and creation."""
         if not self.current_password:
             QMessageBox.warning(self, "Error", "Database not authenticated")
             return
+
+        # Query accounts
+        try:
+            with self.db_manager._get_connection(self.current_password) as conn:
+                cursor = conn.execute("SELECT id, account_name FROM accounts")
+                accounts = cursor.fetchall()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load accounts: {e}")
+            return
+
+        if not accounts:
+            # Prompt to create account
+            account_dialog = QDialog(self)
+            account_dialog.setWindowTitle("Create Account")
+            form = QFormLayout()
+            name_input = QLineEdit()
+            type_combo = QComboBox()
+            type_combo.addItems(["checking", "savings", "credit"])
+            institution_input = QLineEdit()
+            form.addRow("Account Name:", name_input)
+            form.addRow("Account Type:", type_combo)
+            form.addRow("Institution:", institution_input)
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            form.addWidget(buttons)
+            account_dialog.setLayout(form)
+            buttons.accepted.connect(account_dialog.accept)
+            buttons.rejected.connect(account_dialog.reject)
+            if account_dialog.exec_() == QDialog.Accepted:
+                acc_name = name_input.text().strip()
+                acc_type = type_combo.currentText()
+                institution = institution_input.text().strip()
+                if acc_name:
+                    try:
+                        with self.db_manager._get_connection(
+                            self.current_password
+                        ) as conn:
+                            conn.execute(
+                                "INSERT INTO accounts (account_name, account_type, institution) VALUES (?, ?, ?)",
+                                (acc_name, acc_type, institution),
+                            )
+                            conn.commit()
+                            cursor = conn.execute(
+                                "SELECT id, account_name FROM accounts"
+                            )
+                            accounts = cursor.fetchall()
+                    except Exception as e:
+                        QMessageBox.critical(
+                            self, "Error", f"Failed to create account: {e}"
+                        )
+                        return
+                else:
+                    QMessageBox.warning(self, "Error", "Account name required.")
+                    return
+            else:
+                return
 
         # Open file dialog
         file_dialog = QFileDialog()
@@ -498,25 +561,55 @@ class MainWindow(QMainWindow):
             selected_files = file_dialog.selectedFiles()
             if selected_files:
                 file_path = Path(selected_files[0])
-                self._process_file_import(file_path)
+                # Prompt for account selection if multiple
+                if len(accounts) == 1:
+                    account_id = accounts[0][0]
+                else:
+                    from PyQt5.QtWidgets import (
+                        QDialog,
+                        QVBoxLayout,
+                        QLabel,
+                        QComboBox,
+                        QDialogButtonBox,
+                    )
 
-    def _process_file_import(self, file_path: Path):
-        """Process file import in background thread."""
+                    dialog = QDialog(self)
+                    dialog.setWindowTitle("Select Account for Import")
+                    layout = QVBoxLayout()
+                    label = QLabel(
+                        "Select the account to assign imported transactions:"
+                    )
+                    combo = QComboBox()
+                    for acc in accounts:
+                        combo.addItem(acc[1], acc[0])
+                    layout.addWidget(label)
+                    layout.addWidget(combo)
+                    buttons = QDialogButtonBox(
+                        QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+                    )
+                    layout.addWidget(buttons)
+                    dialog.setLayout(layout)
+                    buttons.accepted.connect(dialog.accept)
+                    buttons.rejected.connect(dialog.reject)
+                    if dialog.exec_() == QDialog.Accepted:
+                        account_id = combo.currentData()
+                    else:
+                        return  # Cancelled
+                self._process_file_import(file_path, account_id)
+
+    def _process_file_import(self, file_path: Path, account_id: int):
+        """Process file import in background thread, passing account_id."""
         try:
-            # Show progress bar
             self.progress_bar.setVisible(True)
             self.progress_bar.setValue(0)
 
-            # Start import thread
             self.import_thread = FileImportThread(
-                file_path, self.db_manager, self.current_password
+                file_path, self.db_manager, self.current_password, account_id
             )
             self.import_thread.progress_updated.connect(self._update_import_progress)
             self.import_thread.import_completed.connect(self._import_completed)
             self.import_thread.start()
-
             self.status_bar.showMessage(f"Importing {file_path.name}...")
-
         except Exception as e:
             self.logger.error(f"Failed to start import: {e}")
             QMessageBox.critical(

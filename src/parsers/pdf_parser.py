@@ -19,6 +19,7 @@ from datetime import datetime
 import pdfplumber
 import pytesseract
 from PIL import Image
+import os
 
 from security.file_handler import SecureFileHandler
 
@@ -36,12 +37,52 @@ class PDFParser:
         self.secure_handler = SecureFileHandler()
 
         # Common patterns for financial data extraction
-        self.amount_pattern = re.compile(r"[\$\-]?(\d{1,3}(?:,\d{3})*\.?\d{0,2})")
+        self.amount_pattern = re.compile(
+            r"[\$\-]?((?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d{2})?)"
+        )
+        self.parentheses_amount_pattern = re.compile(r"\((\d{1,3}(?:,\d{3})*\.\d{2})\)")
         self.date_patterns = [
             re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b"),  # MM/DD/YYYY
             re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{2})\b"),  # MM/DD/YY
             re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b"),  # YYYY-MM-DD
+            re.compile(
+                r"\b([A-Z][a-z]{2,9})\s+(\d{1,2}),?\s+(\d{4})\b"
+            ),  # Month DD YYYY
+            re.compile(
+                r"\b(\d{1,2})\s+([A-Z][a-z]{2,9}),?\s+(\d{4})\b"
+            ),  # DD Month YYYY
+            re.compile(
+                r"\b(\d{1,2})-([A-Za-z]{3})-(\d{2,4})\b"
+            ),  # DD-Mon-YY or DD-Mon-YYYY (new)
         ]
+        self.hyphen_month_pattern = re.compile(r"\b(\d{1,2})-([A-Za-z]{3})-(\d{2,4})\b")
+        self.month_map = {
+            "jan": 1,
+            "january": 1,
+            "feb": 2,
+            "february": 2,
+            "mar": 3,
+            "march": 3,
+            "apr": 4,
+            "april": 4,
+            "may": 5,
+            "jun": 6,
+            "june": 6,
+            "jul": 7,
+            "july": 7,
+            "aug": 8,
+            "august": 8,
+            "sep": 9,
+            "sept": 9,
+            "september": 9,
+            "oct": 10,
+            "october": 10,
+            "nov": 11,
+            "november": 11,
+            "dec": 12,
+            "december": 12,
+        }
+        self.debug = os.environ.get("FINANCE_DEBUG", "").lower() == "true"
 
     def parse_file(self, file_path: Path) -> List[Dict[str, Any]]:
         """
@@ -61,23 +102,36 @@ class PDFParser:
             self.logger.info(f"Parsing PDF file: {validated_path}")
 
             transactions = []
+            file_hash = self.secure_handler.calculate_file_hash(validated_path)
 
             # Try text extraction first
             text_transactions = self._extract_text_data(validated_path)
             if text_transactions:
+                # Attach file hash
+                for t in text_transactions:
+                    t["file_hash"] = file_hash
                 transactions.extend(text_transactions)
                 self.logger.info(
                     f"Extracted {len(text_transactions)} transactions from text"
                 )
+            else:
+                if self.debug:
+                    self.logger.debug(
+                        "No text-based transactions found. Dumping sample text excerpt."
+                    )
 
             # If no text data or insufficient data, try OCR
             if len(transactions) == 0:
                 ocr_transactions = self._extract_ocr_data(validated_path)
                 if ocr_transactions:
+                    for t in ocr_transactions:
+                        t["file_hash"] = file_hash
                     transactions.extend(ocr_transactions)
                     self.logger.info(
                         f"Extracted {len(ocr_transactions)} transactions from OCR"
                     )
+                elif self.debug:
+                    self.logger.debug("No OCR transactions found either.")
 
             return transactions
 
@@ -116,6 +170,11 @@ class PDFParser:
                 table_transactions = self._extract_table_data(pdf)
                 if table_transactions:
                     transactions.extend(table_transactions)
+
+                # After collecting all text, optionally log excerpt in debug
+                if self.debug:
+                    sample = all_text[:500].replace("\n", " | ")
+                    self.logger.debug(f"Sample extracted text: {sample}")
 
         except Exception as e:
             self.logger.error(f"Text extraction failed: {e}")
@@ -241,6 +300,9 @@ class PDFParser:
             if transaction:
                 transactions.append(transaction)
 
+        if self.debug and not transactions:
+            self.logger.debug("No transactions extracted from line-based parsing.")
+
         return transactions
 
     def _extract_transaction_from_line(self, line: str) -> Optional[Dict[str, Any]]:
@@ -254,86 +316,126 @@ class PDFParser:
             Optional[Dict[str, Any]]: Transaction data or None
         """
         try:
-            # Look for date pattern
             transaction_date = None
+            matched_date_text = None
             for pattern in self.date_patterns:
                 match = pattern.search(line)
                 if match:
                     try:
-                        if len(match.groups()) == 3:
-                            if len(match.group(3)) == 2:  # YY format
-                                year = 2000 + int(match.group(3))
-                                transaction_date = datetime(
-                                    year, int(match.group(1)), int(match.group(2))
-                                )
-                            else:  # YYYY format
-                                transaction_date = datetime(
-                                    int(match.group(3)),
-                                    int(match.group(1)),
-                                    int(match.group(2)),
-                                )
-                        break
+                        groups = match.groups()
+                        matched_date_text = match.group(0)
+                        if pattern.pattern.startswith(
+                            "\\b(\\d{1,2})/(\\d{1,2})/(\\d{4})"
+                        ):
+                            transaction_date = datetime(
+                                int(groups[2]), int(groups[0]), int(groups[1])
+                            )
+                        elif pattern.pattern.startswith(
+                            "\\b(\\d{1,2})/(\\d{1,2})/(\\d{2})"
+                        ):
+                            year = 2000 + int(groups[2])
+                            transaction_date = datetime(
+                                year, int(groups[0]), int(groups[1])
+                            )
+                        elif pattern.pattern.startswith(
+                            "\\b(\\d{4})-(\\d{1,2})-(\\d{1,2})"
+                        ):
+                            transaction_date = datetime(
+                                int(groups[0]), int(groups[1]), int(groups[2])
+                            )
+                        else:
+                            # Month name patterns or DD-Mon-YY
+                            if pattern is self.date_patterns[
+                                -1
+                            ] or self.hyphen_month_pattern.match(
+                                matched_date_text or ""
+                            ):
+                                # Hyphen format DD-Mon-YY/ YYYY
+                                day = int(groups[0])
+                                month = self.month_map.get(groups[1].lower(), None)
+                                if month:
+                                    year_val = int(groups[2])
+                                    if year_val < 100:  # two-digit year
+                                        year_val += 2000
+                                    transaction_date = datetime(year_val, month, day)
+                            elif groups[0].isalpha():  # Month DD YYYY
+                                month = self.month_map.get(groups[0].lower(), None)
+                                if month:
+                                    transaction_date = datetime(
+                                        int(groups[2]), month, int(groups[1])
+                                    )
+                            else:  # DD Month YYYY
+                                month = self.month_map.get(groups[1].lower(), None)
+                                if month:
+                                    year_val = int(groups[2])
+                                    if year_val < 100:
+                                        year_val += 2000
+                                    transaction_date = datetime(
+                                        year_val, month, int(groups[0])
+                                    )
+                        if transaction_date:
+                            break
                     except ValueError:
                         continue
 
             if not transaction_date:
                 return None
 
-            # Look for amount
-            amount_matches = self.amount_pattern.findall(line)
-            if not amount_matches:
+            paren_match = self.parentheses_amount_pattern.search(line)
+            negative_by_parentheses = False
+            if paren_match:
+                amount_str = paren_match.group(1).replace(",", "")
+                negative_by_parentheses = True
+            else:
+                amount_matches = self.amount_pattern.findall(line)
+                if not amount_matches:
+                    return None
+                amount_str = amount_matches[-1].replace(",", "")
+            try:
+                amount = float(amount_str)
+            except ValueError:
                 return None
+            if negative_by_parentheses:
+                amount = -amount
 
-            # Take the last amount found (usually the transaction amount)
-            amount_str = amount_matches[-1].replace(",", "")
-            amount = float(amount_str)
-
-            # Determine if debit or credit
             transaction_type = (
-                "debit" if "-" in line or "debit" in line.lower() else "credit"
+                "debit"
+                if negative_by_parentheses or "-" in line or "debit" in line.lower()
+                else "credit"
             )
 
-            # Extract description (text between date and amount)
-            description = self._extract_description(line, transaction_date, amount_str)
+            description = self._extract_description(line, matched_date_text, amount_str)
 
             return {
                 "transaction_date": transaction_date.date(),
                 "description": description,
-                "amount": abs(amount),  # Store as positive, type indicates debit/credit
+                "amount": abs(amount),
                 "transaction_type": transaction_type,
-                "category_id": None,  # Will be set by categorizer
+                "category_id": None,
                 "subcategory": None,
                 "notes": None,
-                "file_hash": self.secure_handler.calculate_file_hash(
-                    Path(line)
-                ),  # Placeholder
+                "file_hash": None,
             }
 
         except Exception as e:
             self.logger.debug(f"Failed to parse line '{line}': {e}")
             return None
 
-    def _extract_description(self, line: str, date: datetime, amount_str: str) -> str:
-        """
-        Extract transaction description from line.
-
-        Args:
-            line: Full transaction line
-            date: Transaction date
-            amount_str: Amount string
-
-        Returns:
-            str: Cleaned description
-        """
-        # Remove date and amount from line to get description
-        date_str = date.strftime("%m/%d/%Y")
-        clean_line = line.replace(date_str, "").replace(amount_str, "")
-
-        # Clean up whitespace and common prefixes/suffixes
-        description = re.sub(r"\s+", " ", clean_line).strip()
-        description = re.sub(r"^[\-\*\s]+|[\-\*\s]+$", "", description)
-
-        return description or "Unknown Transaction"
+    def _extract_description(
+        self, line: str, original_date_token: Optional[str], amount_str: str
+    ) -> str:
+        """Extract transaction description from line removing date & amount tokens."""
+        working = line
+        if original_date_token:
+            working = working.replace(original_date_token, " ")
+        # Remove amount occurrences (last amount already captured)
+        working = working.replace(amount_str, " ")
+        # Remove currency symbols and stray hyphens at ends
+        working = re.sub(r"[$]", " ", working)
+        working = re.sub(r"\s+", " ", working).strip()
+        # Remove leading/trailing punctuation or separators
+        working = re.sub(r"^[\-*\s]+|[\-*\s]+$", "", working)
+        return working or "Unknown Transaction"
 
     def _find_column_index(
         self, headers: List[str], keywords: List[str]
@@ -412,20 +514,53 @@ class PDFParser:
             return None
 
     def _parse_date_string(self, date_str: str) -> Optional[datetime]:
-        """Parse date string into datetime object."""
+        """Parse date string into datetime object (extended for DD-Mon-YY)."""
+        # Direct hyphen check first
+        hyphen = self.hyphen_month_pattern.match(date_str.strip())
+        if hyphen:
+            day = int(hyphen.group(1))
+            mon_txt = hyphen.group(2).lower()
+            year_val = int(hyphen.group(3))
+            if year_val < 100:
+                year_val += 2000
+            month = self.month_map.get(mon_txt, None)
+            if month:
+                try:
+                    return datetime(year_val, month, day)
+                except ValueError:
+                    return None
+        # Fallback to existing patterns
         for pattern in self.date_patterns:
             match = pattern.search(date_str)
             if match:
                 try:
                     groups = match.groups()
-                    if len(groups) == 3:
-                        if len(groups[2]) == 2:  # YY format
-                            year = 2000 + int(groups[2])
-                            return datetime(year, int(groups[0]), int(groups[1]))
-                        else:  # YYYY format
-                            return datetime(
-                                int(groups[2]), int(groups[0]), int(groups[1])
-                            )
+                    if pattern is self.date_patterns[0]:  # MM/DD/YYYY
+                        return datetime(int(groups[2]), int(groups[0]), int(groups[1]))
+                    if pattern is self.date_patterns[1]:  # MM/DD/YY
+                        return datetime(
+                            2000 + int(groups[2]), int(groups[0]), int(groups[1])
+                        )
+                    if pattern is self.date_patterns[2]:  # YYYY-MM-DD
+                        return datetime(int(groups[0]), int(groups[1]), int(groups[2]))
+                    if pattern is self.date_patterns[3]:  # Month DD YYYY
+                        month = self.month_map.get(groups[0].lower(), None)
+                        if month:
+                            return datetime(int(groups[2]), month, int(groups[1]))
+                    if pattern is self.date_patterns[4]:  # DD Month YYYY
+                        month = self.month_map.get(groups[1].lower(), None)
+                        if month:
+                            return datetime(int(groups[2]), month, int(groups[0]))
+                    if (
+                        pattern is self.date_patterns[5]
+                    ):  # DD-Mon-YY/ YYYY (handled above but kept for completeness)
+                        day = int(groups[0])
+                        month = self.month_map.get(groups[1].lower(), None)
+                        if month:
+                            year_val = int(groups[2])
+                            if year_val < 100:
+                                year_val += 2000
+                            return datetime(year_val, month, day)
                 except ValueError:
                     continue
         return None
