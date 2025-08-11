@@ -60,7 +60,8 @@ class PasswordDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
-        self.setFixedSize(300, 150)
+        self.setFixedSize(350, 200)
+        self.reset_requested = False
 
         layout = QVBoxLayout()
 
@@ -69,19 +70,49 @@ class PasswordDialog(QDialog):
         self.password_input = QLineEdit()
         self.password_input.setEchoMode(QLineEdit.Password)
 
+        # Info label
+        info_label = QLabel("Enter password to unlock encrypted database")
+        info_label.setStyleSheet("color: gray; font-size: 10px;")
+
         # Buttons
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
 
+        # Reset button
+        self.reset_button = QPushButton("Reset Database")
+        self.reset_button.setStyleSheet("color: red;")
+        self.reset_button.clicked.connect(self._request_reset)
+        
+        button_layout = QHBoxLayout()
+        button_layout.addWidget(self.reset_button)
+        button_layout.addStretch()
+        button_layout.addWidget(self.buttons)
+
         layout.addWidget(self.password_label)
         layout.addWidget(self.password_input)
-        layout.addWidget(self.buttons)
+        layout.addWidget(info_label)
+        layout.addStretch()
+        layout.addLayout(button_layout)
 
         self.setLayout(layout)
 
         # Focus on password input
         self.password_input.setFocus()
+
+    def _request_reset(self):
+        """Handle reset database request."""
+        reply = QMessageBox.question(
+            self,
+            "Reset Database?",
+            "This will DELETE all existing financial data and create a new database.\n"
+            "Are you sure you want to continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.reset_requested = True
+            self.accept()
 
     def get_password(self) -> str:
         """Get the entered password."""
@@ -382,12 +413,44 @@ class MainWindow(QMainWindow):
                     self._load_transactions()
                     self.status_bar.showMessage("Dev database unlocked")
                     return
+                else:
+                    # Dev mode but wrong password - offer to reset
+                    reply = QMessageBox.question(
+                        self,
+                        "Development Mode - Reset Database?",
+                        "Development mode detected but database has different password.\n"
+                        "Reset database with dev password?\n"
+                        "(This will DELETE existing data)",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.No
+                    )
+                    if reply == QMessageBox.Yes:
+                        self.db_manager.db_path.unlink()  # Delete existing database
+                        if self.db_manager.initialize_database(password):
+                            self.current_password = password
+                            self.status_bar.showMessage("Dev database reset")
+                            return
         
         # Normal authentication flow
         while True:
             password_dialog = PasswordDialog(self, "Database Password")
 
             if password_dialog.exec_() == QDialog.Accepted:
+                # Check if reset was requested
+                if password_dialog.reset_requested:
+                    # Delete existing database and create new one
+                    if self.db_manager.db_path.exists():
+                        self.db_manager.db_path.unlink()
+                    
+                    new_password = password_dialog.get_password() or "new_password_123"
+                    if self.db_manager.initialize_database(new_password):
+                        self.current_password = new_password
+                        self.status_bar.showMessage("New database created successfully")
+                        break
+                    else:
+                        QMessageBox.critical(self, "Error", "Failed to create new database")
+                    continue
+
                 password = password_dialog.get_password()
 
                 # Check if database exists
