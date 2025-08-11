@@ -83,7 +83,7 @@ class PasswordDialog(QDialog):
         self.reset_button = QPushButton("Reset Database")
         self.reset_button.setStyleSheet("color: red;")
         self.reset_button.clicked.connect(self._request_reset)
-        
+
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.reset_button)
         button_layout.addStretch()
@@ -108,7 +108,7 @@ class PasswordDialog(QDialog):
             "This will DELETE all existing financial data and create a new database.\n"
             "Are you sure you want to continue?",
             QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
+            QMessageBox.No,
         )
         if reply == QMessageBox.Yes:
             self.reset_requested = True
@@ -397,11 +397,11 @@ class MainWindow(QMainWindow):
         Development: Set FINANCE_DEV_MODE=true to use default password.
         """
         # Development mode bypass
-        dev_mode = os.environ.get('FINANCE_DEV_MODE', '').lower() == 'true'
+        dev_mode = os.environ.get("FINANCE_DEV_MODE", "").lower() == "true"
         if dev_mode:
             password = "dev_password_123"
             self.logger.warning("Running in development mode with default password")
-            
+
             if not self.db_manager.db_path.exists():
                 if self.db_manager.initialize_database(password):
                     self.current_password = password
@@ -422,7 +422,7 @@ class MainWindow(QMainWindow):
                         "Reset database with dev password?\n"
                         "(This will DELETE existing data)",
                         QMessageBox.Yes | QMessageBox.No,
-                        QMessageBox.No
+                        QMessageBox.No,
                     )
                     if reply == QMessageBox.Yes:
                         self.db_manager.db_path.unlink()  # Delete existing database
@@ -430,7 +430,7 @@ class MainWindow(QMainWindow):
                             self.current_password = password
                             self.status_bar.showMessage("Dev database reset")
                             return
-        
+
         # Normal authentication flow
         while True:
             password_dialog = PasswordDialog(self, "Database Password")
@@ -441,14 +441,16 @@ class MainWindow(QMainWindow):
                     # Delete existing database and create new one
                     if self.db_manager.db_path.exists():
                         self.db_manager.db_path.unlink()
-                    
+
                     new_password = password_dialog.get_password() or "new_password_123"
                     if self.db_manager.initialize_database(new_password):
                         self.current_password = new_password
                         self.status_bar.showMessage("New database created successfully")
                         break
                     else:
-                        QMessageBox.critical(self, "Error", "Failed to create new database")
+                        QMessageBox.critical(
+                            self, "Error", "Failed to create new database"
+                        )
                     continue
 
                 password = password_dialog.get_password()
