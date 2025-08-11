@@ -68,7 +68,7 @@ def check_dependencies() -> bool:
         "pdfplumber",
         "pytesseract",
         "sklearn",
-        "sqlcipher3",
+        # "sqlcipher3",  # Optional - using sqlite3 with cryptography instead
         "PyQt5",
         "matplotlib",
         "cryptography",
