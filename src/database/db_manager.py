@@ -185,7 +185,7 @@ class DatabaseManager:
             """
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                account_name TEXT NOT NULL,
+                account_name TEXT NOT NULL UNIQUE,
                 account_type TEXT NOT NULL,  -- 'checking', 'savings', 'credit'
                 institution TEXT,
                 account_number_hash TEXT,  -- Hashed account number for privacy
@@ -329,6 +329,35 @@ class DatabaseManager:
                 conn.execute("ALTER TABLE accounts ADD COLUMN notes TEXT")
                 conn.commit()
 
+            # Ensure unique account names (case-insensitive) for
+            # existing databases. Using a unique index avoids full
+            # table recreation.
+            cursor = conn.execute("PRAGMA index_list(accounts)")
+            existing_indexes = {row[1] for row in cursor.fetchall()}
+            # If a UNIQUE constraint exists, SQLite creates an autoindex.
+            has_auto_unique = any(
+                name.startswith("sqlite_autoindex_accounts")
+                for name in existing_indexes
+            )
+            if (not has_auto_unique) and (
+                "idx_accounts_name_unique" not in existing_indexes
+            ):
+                try:
+                    conn.execute(
+                        "CREATE UNIQUE INDEX idx_accounts_name_unique ON "
+                        "accounts(account_name COLLATE NOCASE)"
+                    )
+                    conn.commit()
+                    self.logger.info("Added unique index on accounts.account_name")
+                except Exception as e:
+                    # Likely due to existing duplicate names; log and
+                    # continue without enforcing
+                    self.logger.warning(
+                        "Could not enforce unique account names (duplicates "
+                        "may exist). Please rename duplicates and restart. "
+                        "Error: %s",
+                        e,
+                    )
         except Exception as e:
             self.logger.warning(f"Migration warning: {e}")
 

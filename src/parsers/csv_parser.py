@@ -56,8 +56,37 @@ class CSVParser:
             "debit_amount",
             "credit_amount",
         ]
-        self.debit_columns = ["debit", "debit_amount", "withdrawal", "payment"]
-        self.credit_columns = ["credit", "credit_amount", "deposit", "income"]
+        # Debit terms typically represent outflows (charges/purchases/fees)
+        self.debit_columns = [
+            "debit",
+            "debit_amount",
+            "withdrawal",
+            "charge",
+            "purchase",
+            "fee",
+        ]
+        # Credit terms typically represent inflows to the account (payments/refunds)
+        self.credit_columns = [
+            "credit",
+            "credit_amount",
+            "deposit",
+            "income",
+            "payment",
+            "pmt",
+            "refund",
+            "reversal",
+            "adjustment",
+        ]
+        # Optional transaction type columns (values like 'Sale', 'Payment', etc.)
+        self.type_hint_columns = [
+            "type",
+            "transaction_type",
+            "trans_type",
+            "transaction",
+            "dr/cr",
+            "debit/credit",
+            "activity",
+        ]
 
         # Date parsing patterns
         self.date_formats = [
@@ -68,6 +97,8 @@ class CSVParser:
             "%Y/%m/%d",  # 2023/12/31
             "%m-%d-%Y",  # 12-31-2023
             "%d-%m-%Y",  # 31-12-2023
+            "%d %b %Y",  # 31 Jan 2025
+            "%d %B %Y",  # 31 January 2025
         ]
 
     def parse_file(self, file_path: Path) -> List[Dict[str, Any]]:
@@ -219,7 +250,7 @@ class CSVParser:
             Optional[Dict[str, str]]: Column mapping or None
         """
         columns = [col.lower().strip() for col in df.columns]
-        mapping = {}
+        mapping: Dict[str, str] = {}
 
         # Find date column
         date_col = None
@@ -262,6 +293,15 @@ class CSVParser:
             return None
 
         mapping["description"] = desc_col
+
+        # Optional: transaction type hint column
+        type_col = None
+        for col_name in columns:
+            if any(t in col_name for t in self.type_hint_columns):
+                type_col = df.columns[columns.index(col_name)]
+                break
+        if type_col:
+            mapping["type_col"] = type_col
 
         # Find amount columns
         amount_col = None
@@ -394,6 +434,16 @@ class CSVParser:
             if not description or description.lower() in ["nan", "none", ""]:
                 description = "Unknown Transaction"
 
+            # Optional type hint value
+            type_hint_val = None
+            if "type_col" in mapping:
+                try:
+                    type_hint_val = (
+                        str(row.get(mapping["type_col"], "")).strip().lower()
+                    )
+                except Exception:
+                    type_hint_val = None
+
             # Parse amount
             if "amount" in mapping:
                 # Single amount column
@@ -402,8 +452,32 @@ class CSVParser:
                 if amount is None:
                     return None
 
-                # Determine transaction type based on sign
-                transaction_type = "debit" if amount < 0 else "credit"
+                # Determine transaction type: first by explicit type hint,
+                # otherwise fall back to sign convention
+                trans_type = None
+                if type_hint_val:
+                    if type_hint_val in [
+                        "credit",
+                        "payment",
+                        "pmt",
+                        "refund",
+                        "reversal",
+                        "adjustment",
+                    ]:
+                        trans_type = "credit"
+                    elif type_hint_val in [
+                        "debit",
+                        "sale",
+                        "purchase",
+                        "charge",
+                        "fee",
+                        "cash advance",
+                    ]:
+                        trans_type = "debit"
+
+                if not trans_type:
+                    trans_type = "debit" if amount < 0 else "credit"
+
                 amount = abs(amount)
 
             else:
@@ -414,20 +488,48 @@ class CSVParser:
                 debit_amount = self._parse_amount_value(debit_value) or 0
                 credit_amount = self._parse_amount_value(credit_value) or 0
 
-                if debit_amount > 0:
+                if debit_amount > 0 and debit_amount >= credit_amount:
                     amount = debit_amount
-                    transaction_type = "debit"
+                    trans_type = "debit"
                 elif credit_amount > 0:
                     amount = credit_amount
-                    transaction_type = "credit"
+                    trans_type = "credit"
                 else:
-                    return None  # No valid amount found
+                    # As a fallback, use type hint with a generic amount if present
+                    if type_hint_val in [
+                        "credit",
+                        "payment",
+                        "pmt",
+                        "refund",
+                        "reversal",
+                        "adjustment",
+                    ]:
+                        amt_guess = debit_amount or credit_amount
+                        if amt_guess <= 0:
+                            return None
+                        amount = amt_guess
+                        trans_type = "credit"
+                    elif type_hint_val in [
+                        "debit",
+                        "sale",
+                        "purchase",
+                        "charge",
+                        "fee",
+                        "cash advance",
+                    ]:
+                        amt_guess = debit_amount or credit_amount
+                        if amt_guess <= 0:
+                            return None
+                        amount = amt_guess
+                        trans_type = "debit"
+                    else:
+                        return None  # No valid amount/type found
 
             return {
                 "transaction_date": transaction_date,
                 "description": description,
                 "amount": amount,
-                "transaction_type": transaction_type,
+                "transaction_type": trans_type,
                 "category_id": None,  # Will be set by categorizer
                 "subcategory": None,
                 "notes": None,
@@ -486,11 +588,20 @@ class CSVParser:
             # Convert to string and clean
             amount_str = str(amount_value).strip()
 
+            # Detect parentheses indicating negative amounts, e.g., ($123.45)
+            is_paren_negative = False
+            if amount_str.startswith("(") and amount_str.endswith(")"):
+                is_paren_negative = True
+                amount_str = amount_str[1:-1]
+
             # Remove currency symbols and commas
             clean_amount = re.sub(r"[^\d\.\-\+]", "", amount_str)
 
             if clean_amount:
-                return float(clean_amount)
+                val = float(clean_amount)
+                if is_paren_negative and val > 0:
+                    val = -val
+                return val
 
         except (ValueError, TypeError):
             pass

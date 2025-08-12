@@ -274,54 +274,86 @@ class PDFParser:
         return transactions
 
     def _extract_table_data(self, pdf) -> List[Dict[str, Any]]:
-        """
-        Extract tabular data from PDF.
-
-        Args:
-            pdf: pdfplumber PDF object
-
-        Returns:
-            List[Dict[str, Any]]: Extracted transactions from tables
-        """
-        transactions = []
-
+        """Extract tabular data from PDF (supports separate debit/credit cols)."""
+        transactions: List[Dict[str, Any]] = []
         try:
             for page in pdf.pages:
                 tables = page.extract_tables()
-
                 for table in tables:
-                    if not table or len(table) < 2:  # Need header + data rows
+                    if not table or len(table) < 2:
                         continue
-
-                    # Identify columns by header patterns
                     header = table[0] if table[0] else []
-                    date_col = self._find_column_index(
-                        header, ["date", "transaction date", "posted"]
-                    )
+                    # Normalize header tokens
+                    norm_header = [h.lower() if h else "" for h in header]
+                    date_col = self._find_column_index(header, ["date", "posted"])
                     desc_col = self._find_column_index(
-                        header, ["description", "merchant", "payee"]
+                        header, ["description", "merchant", "payee", "details"]
                     )
-                    amount_col = self._find_column_index(
-                        header, ["amount", "total", "debit", "credit"]
-                    )
-
-                    # Process data rows
+                    amount_col = self._find_column_index(header, ["amount", "total"])
+                    debit_col = None
+                    credit_col = None
+                    # Identify separate debit / credit columns (common in CC statements)
+                    for idx, name in enumerate(norm_header):
+                        if any(k in name for k in ["debit", "charge"]):
+                            debit_col = idx
+                        if any(k in name for k in ["credit", "payment"]):
+                            credit_col = idx
                     for row in table[1:]:
-                        if not row or len(row) < max(
-                            date_col or 0, desc_col or 0, amount_col or 0
-                        ):
+                        if not row:
                             continue
-
-                        transaction = self._create_transaction_from_row(
-                            row, date_col, desc_col, amount_col
-                        )
-
-                        if transaction:
-                            transactions.append(transaction)
-
+                        # Use combined amount column path
+                        if amount_col is not None and amount_col < len(row):
+                            txn = self._create_transaction_from_row(
+                                row, date_col, desc_col, amount_col
+                            )
+                            if txn:
+                                transactions.append(txn)
+                            continue
+                        # Separate debit/credit columns path
+                        if (
+                            date_col is not None
+                            and desc_col is not None
+                            and (debit_col is not None or credit_col is not None)
+                        ):
+                            # Parse date
+                            date_str = row[date_col] if date_col < len(row) else ""
+                            t_date = self._parse_date_string(date_str)
+                            if not t_date:
+                                continue
+                            description = (
+                                row[desc_col] if desc_col < len(row) else "Unknown"
+                            )
+                            debit_amt = None
+                            credit_amt = None
+                            if debit_col is not None and debit_col < len(row):
+                                debit_amt = self._parse_amount_string(row[debit_col])
+                            if credit_col is not None and credit_col < len(row):
+                                credit_amt = self._parse_amount_string(row[credit_col])
+                            amount = None
+                            txn_type = None
+                            # Prefer whichever column has a value
+                            if debit_amt is not None and debit_amt != 0:
+                                amount = abs(debit_amt)
+                                txn_type = "debit"
+                            elif credit_amt is not None and credit_amt != 0:
+                                amount = abs(credit_amt)
+                                txn_type = "credit"
+                            if amount is None:
+                                continue
+                            transactions.append(
+                                {
+                                    "transaction_date": t_date,
+                                    "description": description.strip(),
+                                    "amount": amount,
+                                    "transaction_type": txn_type,
+                                    "category_id": None,
+                                    "subcategory": None,
+                                    "notes": None,
+                                    "file_hash": None,
+                                }
+                            )
         except Exception as e:
             self.logger.error(f"Table extraction failed: {e}")
-
         return transactions
 
     def _extract_ocr_data(
@@ -524,22 +556,9 @@ class PDFParser:
     def _determine_transaction_type(
         self, line: str, amount: float, negative_by_parentheses: bool, account_type: str
     ) -> str:
-        """
-        Determine transaction type based on account type and transaction details.
-
-        Args:
-            line: Transaction line text
-            amount: Transaction amount
-            negative_by_parentheses: Whether amount was in parentheses
-            account_type: Type of account ('checking', 'savings', 'credit')
-
-        Returns:
-            str: 'debit' or 'credit'
-        """
+        """Determine transaction type with improved credit card heuristics."""
         line_lower = line.lower()
-
         if account_type == "credit":
-            # Credit card logic: purchases are debits, payments are credits
             payment_indicators = [
                 "payment",
                 "autopay",
@@ -552,14 +571,30 @@ class PDFParser:
                 "autopay payment",
                 "online pmt",
                 "pmt",
+                "refund",
+                "credit",
+                "cash reward",
             ]
-
-            # Check for payment indicators
-            if any(indicator in line_lower for indicator in payment_indicators):
-                return "credit"  # Payment reduces credit card balance
-            else:
-                return "debit"  # Purchase increases credit card balance
-
+            purchase_indicators = [
+                "purchase",
+                "pos",
+                "sale",
+                "card purchase",
+                "charge",
+                "fee",
+                "interest",
+                "finance charge",
+                "cash advance",
+            ]
+            if any(ind in line_lower for ind in payment_indicators):
+                return "credit"
+            # Parentheses or negative sign in CC statements usually denote credits/payments
+            if negative_by_parentheses or amount < 0:
+                return "credit"
+            if any(ind in line_lower for ind in purchase_indicators):
+                return "debit"
+            # Default: treat positive amount with no payment indicator as debit (purchase)
+            return "debit"
         else:
             # Bank account logic: deposits are credits, withdrawals/purchases are debits
             credit_indicators = [

@@ -204,6 +204,24 @@ class FileImportThread(QThread):
             # Map predicted categories to database category IDs
             self._map_categories_to_ids(categorized_transactions)
 
+            self.progress_updated.emit(85)
+
+            # Compute a stable file hash (content-based) and size once
+            import hashlib
+
+            try:
+                with open(validated_path, "rb") as f:
+                    file_bytes = f.read()
+                file_hash = hashlib.md5(file_bytes).hexdigest()
+            except Exception:
+                # Fallback to path-based hash if content read fails
+                file_hash = hashlib.md5(str(validated_path).encode()).hexdigest()
+            file_size = validated_path.stat().st_size
+
+            # Attach file_hash to each transaction so we can bulk-delete by file
+            for t in categorized_transactions:
+                t["file_hash"] = file_hash
+
             self.progress_updated.emit(90)
 
             # Save to database
@@ -216,9 +234,11 @@ class FileImportThread(QThread):
                 if transaction_id:
                     success_count += 1
 
-            # Record file import for audit trail
+            # Record file import for audit trail (ensure commit)
             if success_count > 0:
-                self._record_file_import(validated_path, success_count)
+                self._record_file_import(
+                    validated_path, success_count, file_hash, file_size
+                )
 
             self.progress_updated.emit(100)
 
@@ -233,24 +253,33 @@ class FileImportThread(QThread):
             self.logger.error(f"File import failed: {e}")
             self.import_completed.emit(False, f"Import failed: {str(e)}")
 
-    def _record_file_import(self, file_path: str, transaction_count: int) -> None:
-        """Record file import for audit trail."""
+    def _record_file_import(
+        self, file_path: Path, transaction_count: int, file_hash: str, file_size: int
+    ) -> None:
+        """Record file import for audit trail and commit the change.
+
+        If a record with the same file_hash exists (e.g., re-upload of the same
+        file), update it (import_date, size, count, status) so it shows up again.
+        """
         try:
-            import hashlib
-
-            # Calculate file hash for tracking
-            file_hash = hashlib.md5(str(file_path).encode()).hexdigest()
-            file_size = Path(file_path).stat().st_size
-
             with self.db_manager._get_connection(self.password) as conn:
                 conn.execute(
-                    """INSERT INTO file_imports 
-                       (filename, file_hash, file_size, transactions_imported) 
-                       VALUES (?, ?, ?, ?)""",
+                    (
+                        "INSERT INTO file_imports (filename, file_hash, file_size, "
+                        "transactions_imported, import_date, status) VALUES "
+                        "(?, ?, ?, ?, CURRENT_TIMESTAMP, 'completed') "
+                        "ON CONFLICT(file_hash) DO UPDATE SET "
+                        "filename=excluded.filename, "
+                        "file_size=excluded.file_size, "
+                        "transactions_imported=excluded.transactions_imported, "
+                        "import_date=CURRENT_TIMESTAMP, "
+                        "status='completed'"
+                    ),
                     (Path(file_path).name, file_hash, file_size, transaction_count),
                 )
+                conn.commit()
         except Exception as e:
-            print(f"Warning: Could not record file import: {e}")
+            self.logger.warning(f"Could not record file import: {e}")
 
     def _map_categories_to_ids(self, transactions):
         """Map predicted category names to database category IDs."""
@@ -884,9 +913,24 @@ class MainWindow(QMainWindow):
                         with self.db_manager._get_connection(
                             self.current_password
                         ) as conn:
+                            # Check for duplicate account name (case-insensitive)
+                            cur = conn.execute(
+                                "SELECT 1 FROM accounts WHERE lower(account_name)=lower(?) LIMIT 1",
+                                (acc_name,),
+                            )
+                            if cur.fetchone():
+                                QMessageBox.warning(
+                                    self,
+                                    "Duplicate Account",
+                                    "An account with this name already exists. "
+                                    "Please choose a different name.",
+                                )
+                                return
+
                             conn.execute(
-                                "INSERT INTO accounts (account_name, account_type, institution) VALUES (?, ?, ?)",
-                                (acc_name, acc_type, institution),
+                                "INSERT INTO accounts (account_name, account_type, institution) "
+                                "VALUES (?, ?, ?)",
+                                (acc_name, acc_type, institution or None),
                             )
                             conn.commit()
                             cursor = conn.execute(
@@ -1190,6 +1234,20 @@ class MainWindow(QMainWindow):
 
             try:
                 with self.db_manager._get_connection(self.current_password) as conn:
+                    # Check for duplicate account name (case-insensitive)
+                    cur = conn.execute(
+                        "SELECT 1 FROM accounts WHERE lower(account_name)=lower(?) LIMIT 1",
+                        (account_name,),
+                    )
+                    if cur.fetchone():
+                        QMessageBox.warning(
+                            self,
+                            "Duplicate Account",
+                            "An account with this name already exists. "
+                            "Please choose a different name.",
+                        )
+                        return
+
                     conn.execute(
                         """INSERT INTO accounts 
                            (account_name, account_type, institution, notes) 
@@ -1817,6 +1875,424 @@ class MainWindow(QMainWindow):
 
     def _load_analytics_accounts(self):
         """Load accounts into analytics account filter."""
+        if not self.current_password:
+            return
+
+        try:
+            # Clear existing items (except "All Accounts")
+            self.account_filter_combo.clear()
+            self.account_filter_combo.addItem("All Accounts")
+
+            with self.db_manager._get_connection(self.current_password) as conn:
+                cursor = conn.execute(
+                    "SELECT id, account_name FROM accounts ORDER BY account_name"
+                )
+                for account_id, account_name in cursor.fetchall():
+                    self.account_filter_combo.addItem(account_name, account_id)
+
+            # Load initial analytics
+            self._update_analytics()
+
+        except Exception as e:
+            self.logger.error(f"Failed to load analytics accounts: {e}")
+
+    def _update_analytics(self):
+        """Update all analytics data and displays."""
+        if not self.current_password:
+            return
+
+        try:
+            # Get filter parameters
+            period = self.period_combo.currentText()
+            account_filter = self.account_filter_combo.currentData()
+
+            # Build date filter
+            date_filter = self._get_date_filter(period)
+
+            # Get transactions for analysis
+            transactions = self._get_filtered_transactions(date_filter, account_filter)
+
+            # Update summary cards
+            self._update_summary_cards(transactions)
+
+            # Update category breakdown
+            self._update_category_breakdown(transactions)
+
+            # Update monthly trends
+            self._update_monthly_trends(transactions)
+
+            # Update recent large transactions
+            self._update_recent_large_transactions(transactions)
+
+        except Exception as e:
+            self.logger.error(f"Failed to update analytics: {e}")
+
+    def _get_date_filter(self, period: str) -> str:
+        """Get SQL date filter for the selected period."""
+        if period == "Last 30 Days":
+            return "AND transaction_date >= date('now', '-30 days')"
+        elif period == "Last 90 Days":
+            return "AND transaction_date >= date('now', '-90 days')"
+        elif period == "Last 6 Months":
+            return "AND transaction_date >= date('now', '-6 months')"
+        elif period == "Last Year":
+            return "AND transaction_date >= date('now', '-1 year')"
+        elif period == "All Time":
+            return ""
+        else:  # Custom Range - for now, default to last 30 days
+            return "AND transaction_date >= date('now', '-30 days')"
+
+    def _get_filtered_transactions(self, date_filter: str, account_filter):
+        """Get transactions with applied filters."""
+        try:
+            with self.db_manager._get_connection(self.current_password) as conn:
+                query = f"""
+                    SELECT t.*, c.name as category_name, a.account_name
+                    FROM transactions t
+                    LEFT JOIN categories c ON t.category_id = c.id
+                    LEFT JOIN accounts a ON t.account_id = a.id
+                    WHERE 1=1 {date_filter}
+                """
+                params = []
+
+                if account_filter is not None:
+                    query += " AND t.account_id = ?"
+                    params.append(account_filter)
+
+                query += " ORDER BY t.transaction_date DESC"
+
+                cursor = conn.execute(query, params)
+                columns = [description[0] for description in cursor.description]
+                transactions = []
+
+                for row in cursor.fetchall():
+                    transactions.append(dict(zip(columns, row)))
+
+                return transactions
+
+        except Exception as e:
+            self.logger.error(f"Failed to get filtered transactions: {e}")
+            return []
+
+    def _update_summary_cards(self, transactions):
+        """Update the summary cards with transaction data."""
+        total_income = 0
+        total_expenses = 0
+        transaction_count = len(transactions)
+
+        for transaction in transactions:
+            amount = float(transaction.get("amount", 0))
+            trans_type = transaction.get("transaction_type", "")
+
+            if trans_type == "credit":
+                total_income += amount
+            elif trans_type == "debit":
+                total_expenses += amount
+
+        net_amount = total_income - total_expenses
+
+        # Update labels
+        self.income_label.setText(f"${total_income:.2f}")
+        self.expenses_label.setText(f"${total_expenses:.2f}")
+
+        net_color = "#4CAF50" if net_amount >= 0 else "#F44336"
+        self.net_label.setText(f"${net_amount:.2f}")
+        self.net_label.setStyleSheet(
+            f"font-size: 14px; font-weight: bold; color: {net_color};"
+        )
+
+        self.count_label.setText(str(transaction_count))
+
+    def _update_category_breakdown(self, transactions):
+        """Update category breakdown table."""
+        category_totals = {}
+        total_amount = 0
+
+        # Calculate category totals (expenses only)
+        for transaction in transactions:
+            if transaction.get("transaction_type") == "debit":
+                amount = float(transaction.get("amount", 0))
+                category = transaction.get("category_name") or "Uncategorized"
+                category_totals[category] = category_totals.get(category, 0) + amount
+                total_amount += amount
+
+        # Sort by amount
+        sorted_categories = sorted(
+            category_totals.items(), key=lambda x: x[1], reverse=True
+        )
+
+        # Update table
+        self.category_table.setRowCount(len(sorted_categories))
+
+        for row, (category, amount) in enumerate(sorted_categories):
+            percentage = (amount / total_amount * 100) if total_amount > 0 else 0
+
+            self.category_table.setItem(row, 0, QTableWidgetItem(category))
+            self.category_table.setItem(row, 1, QTableWidgetItem(f"${amount:.2f}"))
+            self.category_table.setItem(row, 2, QTableWidgetItem(f"{percentage:.1f}%"))
+
+        self.category_table.resizeColumnsToContents()
+
+    def _update_monthly_trends(self, transactions):
+        """Update monthly trends table."""
+        from collections import defaultdict
+
+        monthly_data = defaultdict(lambda: {"income": 0, "expenses": 0})
+
+        # Group by month
+        for transaction in transactions:
+            date_str = transaction.get("transaction_date", "")
+            if date_str:
+                # Extract year-month from date
+                month_key = date_str[:7]  # YYYY-MM format
+                amount = float(transaction.get("amount", 0))
+                trans_type = transaction.get("transaction_type", "")
+
+                if trans_type == "credit":
+                    monthly_data[month_key]["income"] += amount
+                elif trans_type == "debit":
+                    monthly_data[month_key]["expenses"] += amount
+
+        # Sort by month (most recent first)
+        sorted_months = sorted(monthly_data.items(), key=lambda x: x[0], reverse=True)
+
+        # Update table (show last 6 months max)
+        display_months = sorted_months[:6]
+        self.trends_table.setRowCount(len(display_months))
+
+        for row, (month, data) in enumerate(display_months):
+            income = data["income"]
+            expenses = data["expenses"]
+            net = income - expenses
+
+            self.trends_table.setItem(row, 0, QTableWidgetItem(month))
+            self.trends_table.setItem(row, 1, QTableWidgetItem(f"${income:.2f}"))
+            self.trends_table.setItem(row, 2, QTableWidgetItem(f"${expenses:.2f}"))
+
+            net_item = QTableWidgetItem(f"${net:.2f}")
+            if net < 0:
+                net_item.setStyleSheet("color: red;")
+            else:
+                net_item.setStyleSheet("color: green;")
+            self.trends_table.setItem(row, 3, net_item)
+
+        self.trends_table.resizeColumnsToContents()
+
+    def _update_recent_large_transactions(self, transactions):
+        """Update recent large transactions table."""
+        # Filter for large transactions (top 10 by amount)
+        large_transactions = sorted(
+            transactions, key=lambda x: float(x.get("amount", 0)), reverse=True
+        )[:10]
+
+        self.recent_large_table.setRowCount(len(large_transactions))
+
+        for row, transaction in enumerate(large_transactions):
+            self.recent_large_table.setItem(
+                row, 0, QTableWidgetItem(transaction.get("transaction_date", ""))
+            )
+
+            description = transaction.get("description", "")[
+                :40
+            ]  # Truncate long descriptions
+            self.recent_large_table.setItem(row, 1, QTableWidgetItem(description))
+
+            amount = float(transaction.get("amount", 0))
+            self.recent_large_table.setItem(row, 2, QTableWidgetItem(f"${amount:.2f}"))
+
+            category = transaction.get("category_name") or "Uncategorized"
+            self.recent_large_table.setItem(row, 3, QTableWidgetItem(category))
+
+        self.recent_large_table.resizeColumnsToContents()
+
+    def _create_summary_card(self, title: str, value: str, color: str) -> QWidget:
+        """Create a summary card widget for analytics."""
+        card = QWidget()
+        card.setFixedSize(180, 100)
+        card.setStyleSheet(
+            f"""
+            QWidget {{
+                background-color: white;
+                border: 2px solid {color};
+                border-radius: 8px;
+                margin: 5px;
+            }}
+        """
+        )
+
+        layout = QVBoxLayout()
+        card.setLayout(layout)
+
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-size: 12px; font-weight: bold; color: #666;")
+        title_label.setAlignment(Qt.AlignCenter)
+
+        value_label = QLabel(value)
+        value_label.setObjectName("value")
+        value_label.setStyleSheet(
+            f"font-size: 18px; font-weight: bold; color: {color};"
+        )
+        value_label.setAlignment(Qt.AlignCenter)
+
+        layout.addWidget(title_label)
+        layout.addWidget(value_label)
+
+        return card
+
+    def _load_categories(self):
+        """Load and display categories in the table."""
+        if not self.current_password:
+            return
+
+        try:
+            categories = self.db_manager.get_categories(self.current_password)
+
+            # Update categories table
+            self.categories_table.setRowCount(len(categories))
+
+            for row, category in enumerate(categories):
+                # Category name
+                self.categories_table.setItem(
+                    row, 0, QTableWidgetItem(str(category.get("name", "")))
+                )
+
+                # Category type
+                category_type = "Income" if category.get("is_income") else "Expense"
+                self.categories_table.setItem(row, 1, QTableWidgetItem(category_type))
+
+                # Parent category
+                parent_name = category.get("parent_name", "")
+                self.categories_table.setItem(row, 2, QTableWidgetItem(parent_name))
+
+                # Transaction count (placeholder for now)
+                self.categories_table.setItem(row, 3, QTableWidgetItem("0"))
+
+                # Actions (Delete button)
+                if not category.get(
+                    "parent_name"
+                ):  # Only show delete for non-default categories
+                    delete_btn = QPushButton("Delete")
+                    delete_btn.setStyleSheet("background-color: #ffcccc; color: red;")
+                    category_id = category.get("id")
+                    delete_btn.clicked.connect(
+                        lambda checked, cid=category_id, name=category.get(
+                            "name"
+                        ): self._delete_category(cid, name)
+                    )
+                    self.categories_table.setCellWidget(row, 4, delete_btn)
+
+            # Update statistics
+            total = len(categories)
+            income_count = sum(1 for cat in categories if cat.get("is_income"))
+            expense_count = total - income_count
+
+            self.total_categories_label.setText(f"Total Categories: {total}")
+            self.income_categories_label.setText(f"Income: {income_count}")
+            self.expense_categories_label.setText(f"Expense: {expense_count}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to load categories: {e}")
+            QMessageBox.critical(self, "Error", f"Failed to load categories: {str(e)}")
+
+    def _add_category(self):
+        """Add a new category."""
+        if not self.current_password:
+            QMessageBox.warning(self, "Error", "Database not authenticated")
+            return
+
+        # Create category dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Add New Category")
+        dialog.setFixedSize(400, 200)
+
+        layout = QVBoxLayout()
+
+        # Category name
+        name_layout = QHBoxLayout()
+        name_layout.addWidget(QLabel("Category Name:"))
+        name_input = QLineEdit()
+        name_layout.addWidget(name_input)
+        layout.addLayout(name_layout)
+
+        # Category type
+        type_layout = QHBoxLayout()
+        type_layout.addWidget(QLabel("Type:"))
+        type_combo = QComboBox()
+        type_combo.addItems(["Expense", "Income"])
+        type_layout.addWidget(type_combo)
+        layout.addLayout(type_layout)
+
+        # Description
+        desc_layout = QHBoxLayout()
+        desc_layout.addWidget(QLabel("Description:"))
+        desc_input = QLineEdit()
+        desc_layout.addWidget(desc_input)
+        layout.addLayout(desc_layout)
+
+        # Buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        dialog.setLayout(layout)
+
+        if dialog.exec_() == QDialog.Accepted:
+            name = name_input.text().strip()
+            is_income = type_combo.currentText() == "Income"
+            description = desc_input.text().strip()
+
+            if name:
+                try:
+                    category_id = self.db_manager.add_category(
+                        self.current_password, name, description, is_income
+                    )
+                    if category_id:
+                        QMessageBox.information(
+                            self, "Success", f"Category '{name}' added successfully!"
+                        )
+                        self._load_categories()  # Refresh the table
+                    else:
+                        QMessageBox.warning(self, "Error", "Failed to add category")
+                except Exception as e:
+                    QMessageBox.critical(
+                        self, "Error", f"Failed to add category: {str(e)}"
+                    )
+            else:
+                QMessageBox.warning(self, "Error", "Category name is required")
+
+    def _delete_category(self, category_id: int, category_name: str):
+        """Delete a category with confirmation."""
+        reply = QMessageBox.question(
+            self,
+            "Delete Category",
+            f"Are you sure you want to delete the category '{category_name}'?\n"
+            "This action cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if reply == QMessageBox.Yes:
+            try:
+                success = self.db_manager.delete_category(
+                    self.current_password, category_id
+                )
+                if success:
+                    QMessageBox.information(
+                        self,
+                        "Success",
+                        f"Category '{category_name}' deleted successfully!",
+                    )
+                    self._load_categories()  # Refresh the table
+                else:
+                    QMessageBox.warning(self, "Error", "Failed to delete category")
+            except Exception as e:
+                QMessageBox.critical(
+                    self, "Error", f"Failed to delete category: {str(e)}"
+                )
+
+    def _load_analytics_accounts(self):
+        """Load accounts for analytics filtering."""
         if not self.current_password:
             return
 
